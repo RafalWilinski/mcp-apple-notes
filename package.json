@@ -11,7 +11,8 @@
     "build": "bun build index.ts --outdir dist --target node",
     "start": "bun index.ts",
     "purge-db": "rm -rf ~/.mcp-apple-notes",
-    "test": "npx tsx index.test.ts"
+    "test": "npx tsx index.test.ts",
+    "index-notes": "bun cli.ts"
   },
   "exports": {
     ".": "./index.ts"

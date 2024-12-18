@@ -37,6 +37,8 @@ bun install
 
 ## Usage
 
+### Option 1: Using Claude Desktop
+
 1. Open Claude desktop app and go to Settings -> Developer -> Edit Config
 
 ![Claude Desktop Settings](./images/desktop_settings.png)
@@ -61,6 +63,19 @@ Important: Replace `<YOUR_USER_NAME>` with your actual username.
 ![Claude MCP Connection Status](./images/verify_installation.png)
 
 4. Start by indexing your notes. Ask Claude to index your notes by saying something like: "Index my notes" or "Index my Apple Notes".
+
+### Option 2: Using CLI Directly
+
+You can also index your notes directly from the command line:
+
+```bash
+bun run index-notes
+```
+
+This will:
+1. Create/connect to the notes database
+2. Fetch and index all your Apple Notes
+3. Show progress and statistics about the indexing process
 
 ## Troubleshooting
 
