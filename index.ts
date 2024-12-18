@@ -71,7 +71,7 @@ const GetNoteSchema = z.object({
   title: z.string(),
 });
 
-const server = new Server(
+export const server = new Server(
   {
     name: "my-apple-notes-mcp",
     version: "1.0.0",
@@ -82,6 +82,18 @@ const server = new Server(
     },
   }
 );
+
+// Add a shutdown method
+export const shutdown = async () => {
+  await db.close();
+  // Force cleanup of the pipeline
+  if (extractor) {
+    // @ts-ignore - accessing internal cleanup method
+    await extractor?.cleanup?.();
+  }
+  // Force exit since stdio transport doesn't have cleanup
+  process.exit(0);
+};
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
@@ -144,16 +156,91 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
-const getNotes = async () => {
-  const notes = await runJxa(`
-    const app = Application('Notes');
-app.includeStandardAdditions = true;
-const notes = Array.from(app.notes());
-const titles = notes.map(note => note.properties().name);
-return titles;
-  `);
+const getNotes = async function* () {
+  console.log("   Requesting notes list from Apple Notes...");
+  try {
+    const BATCH_SIZE = 25;
+    let startIndex = 1;
+    let hasMore = true;
 
-  return notes as string[];
+    // First get the total count
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60000);
+
+    const totalCount = await Promise.race([
+      runJxa(`
+        const app = Application('Notes');
+        app.includeStandardAdditions = true;
+        return app.notes().length;
+      `),
+      new Promise((_, reject) => {
+        controller.signal.addEventListener('abort', () => 
+          reject(new Error('Getting notes count timed out after 60s'))
+        );
+      })
+    ]) as number;
+
+    clearTimeout(timeout);
+    console.log(`   📊 Total notes found: ${totalCount}`);
+
+    while (hasMore) {
+      console.log(`   Fetching batch of notes (${startIndex} to ${startIndex + BATCH_SIZE - 1})...`);
+      
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 60000);
+
+      const batchResult = await Promise.race([
+        runJxa(`
+          const app = Application('Notes');
+          app.includeStandardAdditions = true;
+          
+          const titles = [];
+          for (let i = ${startIndex}; i < ${startIndex + BATCH_SIZE}; i++) {
+            try {
+              const note = app.notes[i - 1];
+              if (note) {
+                titles.push(note.name());
+              }
+            } catch (error) {
+              continue;
+            }
+          }
+          return titles;
+        `),
+        new Promise((_, reject) => {
+          controller.signal.addEventListener('abort', () => 
+            reject(new Error('Getting notes batch timed out after 60s'))
+          );
+        })
+      ]);
+
+      clearTimeout(timeout);
+      
+      const titles = batchResult as string[];
+      
+      // Yield the batch along with progress info
+      yield {
+        titles,
+        progress: {
+          current: startIndex + titles.length - 1,
+          total: totalCount,
+          batch: {
+            start: startIndex,
+            end: startIndex + BATCH_SIZE - 1
+          }
+        }
+      };
+      
+      startIndex += BATCH_SIZE;
+      hasMore = startIndex <= totalCount && titles.length > 0;
+
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+
+  } catch (error) {
+    console.error("   ❌ Error getting notes list:", error.message);
+    throw new Error(`Failed to get notes list: ${error.message}`);
+  }
 };
 
 const getNoteDetailsByTitle = async (title: string) => {
@@ -185,45 +272,104 @@ const getNoteDetailsByTitle = async (title: string) => {
   };
 };
 
-export const indexNotes = async (notesTable: any) => {
+export const indexNotes = async (
+  notesTable: any, 
+  deps = {
+    getNotes,
+    getNoteDetailsByTitle
+  }
+) => {
   const start = performance.now();
   let report = "";
-  const allNotes = (await getNotes()) || [];
-  const notesDetails = await Promise.all(
-    allNotes.map((note) => {
-      try {
-        return getNoteDetailsByTitle(note);
-      } catch (error) {
-        report += `Error getting note details for ${note}: ${error.message}\n`;
-        return {} as any;
-      }
-    })
-  );
+  let processed = 0;
+  let successful = 0;
+  let failed = 0;
+  let allNotes: string[] = [];
+  
+  console.log("📚 Getting and processing notes...");
+  
+  // Use injected dependencies instead of globals
+  for await (const batch of deps.getNotes()) {
+    allNotes = [...allNotes, ...batch.titles];
+    console.log(`\n📦 Processing batch of ${batch.titles.length} notes (${batch.progress.current}/${batch.progress.total})`);
+    
+    const batchResults = await Promise.all(
+      batch.titles.map(async (note) => {
+        try {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 30000);
+          
+          try {
+            const result = await Promise.race([
+              deps.getNoteDetailsByTitle(note),
+              new Promise((_, reject) => {
+                controller.signal.addEventListener('abort', () => 
+                  reject(new Error('Note processing timed out after 30s'))
+                );
+              })
+            ]);
+            
+            clearTimeout(timeout);
+            processed++;
+            successful++;
+            
+            if (processed % 10 === 0 || processed === batch.progress.total) {
+              const progress = ((processed / batch.progress.total) * 100).toFixed(1);
+              console.log(`   Progress: ${processed}/${batch.progress.total} notes (${progress}%) | ✅ ${successful} | ❌ ${failed}`);
+            }
+            
+            return result;
+          } catch (error) {
+            clearTimeout(timeout);
+            throw error;
+          }
+        } catch (error) {
+          failed++;
+          report += `Error processing note "${note}": ${error.message}\n`;
+          return {} as any;
+        }
+      })
+    );
 
-  const chunks = notesDetails
-    .filter((n) => n.title)
-    .map((node) => {
-      try {
-        return {
-          ...node,
-          content: turndown(node.content || ""), // this sometimes fails
-        };
-      } catch (error) {
-        return node;
-      }
-    })
-    .map((note, index) => ({
-      id: index.toString(),
-      title: note.title,
-      content: note.content, // turndown(note.content || ""),
-      creation_date: note.creation_date,
-      modification_date: note.modification_date,
-    }));
+    console.log("📥 Converting batch to markdown format...");
+    const batchChunks = batchResults
+      .filter((n) => n.title)
+      .map((node) => {
+        try {
+          return {
+            ...node,
+            content: turndown(node.content || ""),
+          };
+        } catch (error) {
+          report += `Error converting note "${node.title}" to markdown: ${error.message}\n`;
+          return node;
+        }
+      })
+      .map((note, index) => ({
+        id: (processed - batch.titles.length + index).toString(),
+        title: note.title,
+        content: note.content,
+        creation_date: note.creation_date,
+        modification_date: note.modification_date,
+        // Remove vector field from the data we're adding
+        // vector: undefined
+      }));
 
-  await notesTable.add(chunks);
+    if (batchChunks.length > 0) {
+      console.log(`💾 Adding batch to database (${batchChunks.length} notes)...`);
+      try {
+        await notesTable.add(batchChunks);
+      } catch (error) {
+        report += `Error adding batch to database: ${error.message}\n`;
+        failed += batchChunks.length;
+        successful -= batchChunks.length;
+      }
+    }
+  }
 
   return {
-    chunks: chunks.length,
+    chunks: successful,
+    failed,
     report,
     allNotes: allNotes.length,
     time: performance.now() - start,
@@ -232,6 +378,8 @@ export const indexNotes = async (notesTable: any) => {
 
 export const createNotesTable = async (overrideName?: string) => {
   const start = performance.now();
+  
+  // Create a fresh table
   const notesTable = await db.createEmptyTable(
     overrideName || "notes",
     notesTableSchema,
@@ -383,3 +531,5 @@ const CreateNoteSchema = z.object({
   title: z.string(),
   content: z.string(),
 });
+
+export { db };
